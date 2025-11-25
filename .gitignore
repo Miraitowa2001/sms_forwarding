@@ -1,0 +1,10 @@
+# 忽略配置文件（包含敏感信息）
+config.h
+
+# 编译输出
+build/
+*.o
+*.bin
+*.elf
+*.hex
+.history/
