@@ -62,7 +62,7 @@ struct RuntimeConfig {
 #define TXD 3
 #define RXD 4
 
-// 格式化 PDU 时间戳为可读格式
+// 格式化 PDU 时间戳为可读格式，并统一转换为中国标准时间 (UTC+8)
 // 输入格式: YYMMDDHHmmss+TZ (如 25112614465832)
 // 输出格式: 20YY-MM-DD HH:mm:ss
 String formatTimestamp(const char* pduTimestamp) {
@@ -70,17 +70,49 @@ String formatTimestamp(const char* pduTimestamp) {
   if (pduTimestamp == NULL || strlen(pduTimestamp) < 12) {
     return pduTimestamp ? String(pduTimestamp) : String("未知时间");
   }
-  char formatted[32];
-  // 提取各部分（PDU时间戳中每两位数字是反序的，但pdulib已经处理好了）
-  char year[3] = {pduTimestamp[0], pduTimestamp[1], '\0'};
-  char month[3] = {pduTimestamp[2], pduTimestamp[3], '\0'};
-  char day[3] = {pduTimestamp[4], pduTimestamp[5], '\0'};
-  char hour[3] = {pduTimestamp[6], pduTimestamp[7], '\0'};
-  char minute[3] = {pduTimestamp[8], pduTimestamp[9], '\0'};
-  char second[3] = {pduTimestamp[10], pduTimestamp[11], '\0'};
   
-  snprintf(formatted, sizeof(formatted), "20%s-%s-%s %s:%s:%s",
-           year, month, day, hour, minute, second);
+  // 解析 PDU 时间
+  int year = 2000 + (pduTimestamp[0] - '0') * 10 + (pduTimestamp[1] - '0');
+  int month = (pduTimestamp[2] - '0') * 10 + (pduTimestamp[3] - '0');
+  int day = (pduTimestamp[4] - '0') * 10 + (pduTimestamp[5] - '0');
+  int hour = (pduTimestamp[6] - '0') * 10 + (pduTimestamp[7] - '0');
+  int minute = (pduTimestamp[8] - '0') * 10 + (pduTimestamp[9] - '0');
+  int second = (pduTimestamp[10] - '0') * 10 + (pduTimestamp[11] - '0');
+  
+  // 解析时区 (如果有)
+  int tzOffsetSeconds = 0;
+  if (strlen(pduTimestamp) >= 14) {
+    char tzStr[3] = {pduTimestamp[12], pduTimestamp[13], '\0'};
+    if (isdigit(tzStr[0]) && isdigit(tzStr[1])) {
+      // PDU 时区单位为 15 分钟
+      // 注意：这里假设时区为正数（UK/CN 均为正或0），未处理负时区符号位
+      tzOffsetSeconds = atoi(tzStr) * 15 * 60;
+    }
+  }
+
+  struct tm tm_in = {0};
+  tm_in.tm_year = year - 1900;
+  tm_in.tm_mon = month - 1;
+  tm_in.tm_mday = day;
+  tm_in.tm_hour = hour;
+  tm_in.tm_min = minute;
+  tm_in.tm_sec = second;
+  tm_in.tm_isdst = -1;
+
+  // 计算 UTC 时间戳 (假设系统默认为 UTC)
+  time_t t = mktime(&tm_in);
+  
+  // 转换为中国标准时间 (UTC+8)
+  // 1. 减去 PDU 时区偏移，得到真实 UTC
+  // 2. 加上 8 小时 (28800 秒)
+  t = t - tzOffsetSeconds + 28800;
+  
+  struct tm *tm_out = gmtime(&t);
+  
+  char formatted[32];
+  snprintf(formatted, sizeof(formatted), "%04d-%02d-%02d %02d:%02d:%02d",
+           tm_out->tm_year + 1900, tm_out->tm_mon + 1, tm_out->tm_mday,
+           tm_out->tm_hour, tm_out->tm_min, tm_out->tm_sec);
   return String(formatted);
 }
 
@@ -117,8 +149,8 @@ PDU pdu = PDU(4096);
 WiFiClientSecure ssl_client;
 SMTPClient smtp(ssl_client);
 
-#define SERIAL_BUFFER_SIZE 500
-#define MAX_PDU_LENGTH 300
+#define SERIAL_BUFFER_SIZE 2048
+#define MAX_PDU_LENGTH 1024
 char serialBuf[SERIAL_BUFFER_SIZE];
 int serialBufLen = 0;
 
@@ -129,7 +161,7 @@ int serialBufLen = 0;
 
 // 固定长度缓冲区（避免堆碎片化）
 #define SMS_SENDER_LEN 32
-#define SMS_TEXT_LEN 320      // 支持长短信（约2条拼接）
+#define SMS_TEXT_LEN 1280      // 支持长短信（约 400 个汉字）
 #define SMS_TIMESTAMP_LEN 32
 
 struct SMSItem {
@@ -887,18 +919,42 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   return sent;
 }
 
+// 生成 HTML 头部（含 CSS 样式）
+String getHeader(String title) {
+  String h = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>" + title + "</title>";
+  h += "<style>";
+  h += "body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;max-width:800px;margin:0 auto;padding:10px;background:#f0f2f5;color:#333}";
+  h += ".card{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin-bottom:20px}";
+  h += "h2{margin-top:0;color:#1a73e8;border-bottom:2px solid #1a73e8;padding-bottom:10px}";
+  h += "input[type=text],input[type=password],input[type=number],textarea,select{width:100%;padding:10px;margin:5px 0 15px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:14px}";
+  h += "input[type=submit],button{background:#1a73e8;color:#fff;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;font-size:16px;width:100%}";
+  h += "input[type=submit]:hover{background:#1557b0}";
+  h += "table{width:100%;border-collapse:collapse;margin-top:10px}th,td{padding:12px;border-bottom:1px solid #ddd;text-align:left}th{background:#f8f9fa}";
+  h += ".nav{margin-bottom:20px;background:#fff;padding:15px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+  h += ".nav a{margin-right:20px;text-decoration:none;color:#1a73e8;font-weight:600;font-size:16px}.nav a:hover{text-decoration:underline}";
+  h += "label{font-weight:600;display:block;margin-bottom:5px;color:#555}.check-group{margin-bottom:15px;display:flex;align-items:center;background:#f8f9fa;padding:10px;border-radius:4px}.check-group input{width:auto;margin:0 10px 0 0}";
+  h += ".status-ok{color:#28a745;font-weight:bold}.status-err{color:#dc3545;font-weight:bold}";
+  h += "</style></head><body>";
+  h += "<div class='nav'><a href='/'>🏠 仪表盘</a><a href='/config'>⚙️ 配置</a><a href='/queue'>📨 队列</a></div>";
+  return h;
+}
+
+// 生成 HTML 尾部
+String getFooter() {
+  return "<div style='text-align:center;margin-top:30px;color:#888;font-size:12px'>SMS Forwarder</div></body></html>";
+}
+
 // Web 页面：根目录（仪表盘 + 发送表单）
 void handleRoot() {
   if (!checkAuth()) { requestAuth(); return; }
-  String html = "<html><head><meta charset=\"utf-8\"><title>SMS Forwarder</title></head><body>";
-  html += "<h2>SMS Forwarder</h2>";
+  String html = getHeader("SMS Forwarder - 仪表盘");
+  html += "<div class='card'><h2>发送短信</h2>";
   html += "<form method=\"POST\" action=\"/send\">";
-  html += "目标号码：<input name=\"to\" size=20><br>";
-  html += "消息：<br><textarea name=\"msg\" rows=6 cols=40></textarea><br>";
+  html += "<label>目标号码</label><input name=\"to\" placeholder=\"输入手机号\">";
+  html += "<label>消息内容</label><textarea name=\"msg\" rows=5 placeholder=\"输入短信内容\"></textarea>";
   html += "<input type=\"submit\" value=\"发送短信\">";
-  html += "</form>";
-  html += "<p><a href=\"/config\">配置</a> | <a href=\"/queue\">队列</a></p>";
-  html += "</body></html>";
+  html += "</form></div>";
+  html += getFooter();
   webServer.send(200, "text/html", html);
 }
 
@@ -916,33 +972,45 @@ void handleSend() {
     return;
   }
   bool ok = sendSMS(to.c_str(), msg.c_str());
-  String res = ok ? "已发送" : "发送失败";
-  webServer.send(200, "text/plain; charset=utf-8", res + "\n");
+  
+  String html = getHeader("发送结果");
+  html += "<div class='card' style='text-align:center'><h2>" + String(ok ? "✅ 发送成功" : "❌ 发送失败") + "</h2>";
+  html += "<p><a href='/'>返回首页</a></p></div>";
+  html += getFooter();
+  webServer.send(200, "text/html", html);
 }
 
 // 配置页面（查看与保存）
 void handleConfigGet() {
   if (!checkAuth()) { requestAuth(); return; }
-  String html = "<html><head><meta charset=\"utf-8\"><title>配置</title></head><body>";
-  html += "<h2>配置</h2>";
+  String html = getHeader("系统配置");
+  html += "<div class='card'><h2>参数设置</h2>";
   html += "<form method=\"POST\" action=\"/config\">";
-  html += "企业微信 Webhook：<br><input name=\"wecom\" size=60 value=\"" + htmlEncode(String(rtConfig.wecomUrl)) + "\"><br>";
-  html += "接收号码：<br><input name=\"simnum\" size=20 value=\"" + htmlEncode(String(rtConfig.simNumber)) + "\"><br>";
-  html += "SMTP 服务器：<br><input name=\"smtpserver\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpServer)) + "\"><br>";
-  html += "SMTP 端口：<br><input name=\"smtpport\" size=6 value=\"" + String(rtConfig.smtpPort) + "\"><br>";
-  html += "SMTP 用户：<br><input name=\"smtpuser\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpUser)) + "\"><br>";
-  html += "SMTP 密码：<br><input name=\"smtppass\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpPass)) + "\"><br>";
-  html += "邮件收件：<br><input name=\"smtpto\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpTo)) + "\"><br>";
-  html += "HTTP 服务器：<br><input name=\"httpurl\" size=60 value=\"" + htmlEncode(String(rtConfig.httpServerUrl)) + "\"><br>";
-  html += "启用 企业微信：<input type=\"checkbox\" name=\"enwecom\" " + String(rtConfig.enableWecom?"checked":"") + "><br>";
-  html += "启用 邮件：<input type=\"checkbox\" name=\"enemail\" " + String(rtConfig.enableEmail?"checked":"") + "><br>";
-  html += "启用 HTTP：<input type=\"checkbox\" name=\"enhttp\" " + String(rtConfig.enableHttp?"checked":"") + "><br>";
-  html += "Web 用户：<br><input name=\"webuser\" size=20 value=\"" + htmlEncode(String(rtConfig.webUser)) + "\"><br>";
-  html += "Web 密码：<br><input name=\"webpass\" size=20 value=\"" + htmlEncode(String(rtConfig.webPass)) + "\"><br>";
-  html += "<input type=\"submit\" value=\"保存\">";
-  html += "</form>";
-  html += "<p><a href=\"/\">返回</a></p>";
-  html += "</body></html>";
+  
+  html += "<label>企业微信 Webhook</label><input name=\"wecom\" value=\"" + htmlEncode(String(rtConfig.wecomUrl)) + "\">";
+  html += "<div class='check-group'><input type=\"checkbox\" name=\"enwecom\" " + String(rtConfig.enableWecom?"checked":"") + "><label class='checkbox-label'>启用企业微信推送</label></div>";
+  
+  html += "<label>本机号码 (用于标识)</label><input name=\"simnum\" value=\"" + htmlEncode(String(rtConfig.simNumber)) + "\">";
+  
+  html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
+  html += "<label>SMTP 服务器</label><input name=\"smtpserver\" value=\"" + htmlEncode(String(rtConfig.smtpServer)) + "\">";
+  html += "<label>SMTP 端口</label><input name=\"smtpport\" type=\"number\" value=\"" + String(rtConfig.smtpPort) + "\">";
+  html += "<label>SMTP 用户 (邮箱)</label><input name=\"smtpuser\" value=\"" + htmlEncode(String(rtConfig.smtpUser)) + "\">";
+  html += "<label>SMTP 授权码/密码</label><input name=\"smtppass\" type=\"password\" value=\"" + htmlEncode(String(rtConfig.smtpPass)) + "\">";
+  html += "<label>接收邮箱</label><input name=\"smtpto\" value=\"" + htmlEncode(String(rtConfig.smtpTo)) + "\">";
+  html += "<div class='check-group'><input type=\"checkbox\" name=\"enemail\" " + String(rtConfig.enableEmail?"checked":"") + "><label class='checkbox-label'>启用邮件推送</label></div>";
+
+  html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
+  html += "<label>HTTP 推送 URL</label><input name=\"httpurl\" value=\"" + htmlEncode(String(rtConfig.httpServerUrl)) + "\">";
+  html += "<div class='check-group'><input type=\"checkbox\" name=\"enhttp\" " + String(rtConfig.enableHttp?"checked":"") + "><label class='checkbox-label'>启用 HTTP 推送</label></div>";
+
+  html += "<hr style='margin:20px 0;border:0;border-top:1px solid #eee'>";
+  html += "<label>Web 管理员用户名</label><input name=\"webuser\" value=\"" + htmlEncode(String(rtConfig.webUser)) + "\">";
+  html += "<label>Web 管理员密码</label><input name=\"webpass\" type=\"password\" value=\"" + htmlEncode(String(rtConfig.webPass)) + "\">";
+
+  html += "<input type=\"submit\" value=\"保存配置\">";
+  html += "</form></div>";
+  html += getFooter();
   webServer.send(200, "text/html", html);
 }
 
@@ -978,31 +1046,41 @@ void handleConfigPost() {
   strlcpy(rtConfig.webPass, webpass.c_str(), sizeof(rtConfig.webPass));
 
   saveConfig();
-  webServer.send(200, "text/plain; charset=utf-8", "配置已保存\n");
+  String html = getHeader("保存成功");
+  html += "<div class='card' style='text-align:center'><h2>✅ 配置已保存</h2><p>新配置已生效。</p><p><a href='/config'>返回配置页</a></p></div>";
+  html += getFooter();
+  webServer.send(200, "text/html", html);
 }
 
 // 队列查看页面
 void handleQueue() {
   if (!checkAuth()) { requestAuth(); return; }
-  String html = "<html><head><meta charset=\"utf-8\"><title>队列</title></head><body>";
-  html += "<h2>待重试短信队列</h2>";
-  html += "<table border=1><tr><th>#</th><th>发送者</th><th>时间</th><th>内容</th><th>状态</th></tr>";
-  for (int i = 0; i < sms_q_count; i++) {
-    int idx = (sms_q_head + i) % SMS_QUEUE_SIZE;
-    SMSItem &it = smsQueue[idx];
-    html += "<tr>";
-    html += "<td>" + String(i+1) + "</td>";
-    html += "<td>" + String(it.sender) + "</td>";
-    html += "<td>" + String(it.timestamp) + "</td>";
-    html += "<td>" + htmlEncode(String(it.text)) + "</td>";
-    String st = "";
-    st += (it.wecomSent?"wecom ":"");
-    st += (it.emailSent?"email ":"");
-    st += (it.httpSent?"http ":"");
-    html += "<td>" + st + "</td>";
-    html += "</tr>";
+  String html = getHeader("消息队列");
+  html += "<div class='card'><h2>待重试短信队列</h2>";
+  
+  if (sms_q_count == 0) {
+    html += "<p style='text-align:center;padding:20px;color:#666'>队列为空，所有消息已处理。</p>";
+  } else {
+    html += "<div style='overflow-x:auto'><table><thead><tr><th>#</th><th>发送者</th><th>时间</th><th>内容</th><th>状态</th></tr></thead><tbody>";
+    for (int i = 0; i < sms_q_count; i++) {
+      int idx = (sms_q_head + i) % SMS_QUEUE_SIZE;
+      SMSItem &it = smsQueue[idx];
+      html += "<tr>";
+      html += "<td>" + String(i+1) + "</td>";
+      html += "<td>" + String(it.sender) + "</td>";
+      html += "<td>" + String(it.timestamp) + "</td>";
+      html += "<td>" + htmlEncode(String(it.text)) + "</td>";
+      String st = "";
+      if(it.wecomSent) st += "<span class='status-ok'>WeCom✓</span> "; else if(rtConfig.enableWecom) st += "<span class='status-err'>WeCom✗</span> ";
+      if(it.emailSent) st += "<span class='status-ok'>Email✓</span> "; else if(rtConfig.enableEmail) st += "<span class='status-err'>Email✗</span> ";
+      if(it.httpSent) st += "<span class='status-ok'>HTTP✓</span> "; else if(rtConfig.enableHttp) st += "<span class='status-err'>HTTP✗</span> ";
+      html += "<td>" + st + "</td>";
+      html += "</tr>";
+    }
+    html += "</tbody></table></div>";
   }
-  html += "</table><p><a href=\"/\">返回</a></p></body></html>";
+  html += "</div>";
+  html += getFooter();
   webServer.send(200, "text/html", html);
 }
 

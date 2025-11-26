@@ -1,6 +1,15 @@
 # 忽略配置文件（包含敏感信息）
 config.h
 
+# Python 相关
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# 短信日志（包含隐私数据）
+sms_log.json
+
 # 编译输出
 build/
 *.o
@@ -8,3 +17,9 @@ build/
 *.elf
 *.hex
 .history/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
