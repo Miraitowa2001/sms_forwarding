@@ -8,6 +8,9 @@
 #include <ReadyMail.h>
 #include <HTTPClient.h>
 #include <esp_task_wdt.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <base64.h>
 
 // 看门狗超时（秒）
 #define WDT_TIMEOUT_SEC 60
@@ -21,9 +24,65 @@
 // 引入配置文件（敏感信息在此文件中定义）
 #include "config.h"
 
+// Web 服务器端口
+#define WEB_SERVER_PORT 80
+
+// Web 管理界面默认账号密码
+#ifndef WEB_ADMIN_USER
+#define WEB_ADMIN_USER "admin"
+#endif
+#ifndef WEB_ADMIN_PASS
+#define WEB_ADMIN_PASS "admin123"
+#endif
+
+// Web 服务器实例
+WebServer webServer(WEB_SERVER_PORT);
+
+// 持久化存储实例
+Preferences preferences;
+
+// 运行时配置结构体（可通过Web界面修改）
+struct RuntimeConfig {
+  char wecomUrl[256];
+  char simNumber[32];
+  char smtpServer[64];
+  uint16_t smtpPort;
+  char smtpUser[64];
+  char smtpPass[64];
+  char smtpTo[64];
+  char httpServerUrl[128];
+  bool enableWecom;
+  bool enableEmail;
+  bool enableHttp;
+  char webUser[32];
+  char webPass[32];
+} rtConfig;
+
 //串口映射
 #define TXD 3
 #define RXD 4
+
+// 格式化 PDU 时间戳为可读格式
+// 输入格式: YYMMDDHHmmss+TZ (如 25112614465832)
+// 输出格式: 20YY-MM-DD HH:mm:ss
+String formatTimestamp(const char* pduTimestamp) {
+  // 空指针保护
+  if (pduTimestamp == NULL || strlen(pduTimestamp) < 12) {
+    return pduTimestamp ? String(pduTimestamp) : String("未知时间");
+  }
+  char formatted[32];
+  // 提取各部分（PDU时间戳中每两位数字是反序的，但pdulib已经处理好了）
+  char year[3] = {pduTimestamp[0], pduTimestamp[1], '\0'};
+  char month[3] = {pduTimestamp[2], pduTimestamp[3], '\0'};
+  char day[3] = {pduTimestamp[4], pduTimestamp[5], '\0'};
+  char hour[3] = {pduTimestamp[6], pduTimestamp[7], '\0'};
+  char minute[3] = {pduTimestamp[8], pduTimestamp[9], '\0'};
+  char second[3] = {pduTimestamp[10], pduTimestamp[11], '\0'};
+  
+  snprintf(formatted, sizeof(formatted), "20%s-%s-%s %s:%s:%s",
+           year, month, day, hour, minute, second);
+  return String(formatted);
+}
 
 // JSON 字符串转义函数，防止特殊字符破坏 JSON 格式
 String escapeJson(const char* str) {
@@ -80,7 +139,25 @@ struct SMSItem {
   uint8_t retries;
   unsigned long lastAttempt;
   bool valid;  // 标记该槽位是否有效
+  // 各渠道发送状态：true=已成功，false=待发送/重试
+  bool wecomSent;
+  bool emailSent;
+  bool httpSent;
 };
+
+// 函数前向声明（解决编译顺序问题）
+void enqueueSMS(const char* sender, const char* text, const char* timestamp);
+void enqueueSMSWithStatus(const char* sender, const char* text, const char* timestamp, bool wecomOk, bool emailOk, bool httpOk);
+void removeHeadSMS();
+bool trySendChannels(SMSItem &item);  // 改为非const，需要更新状态
+void processSMSQueue();
+void ensureWiFiConnected();
+void loadConfig();
+void saveConfig();
+void setupWebServer();
+bool checkAuth();
+bool sendSMS(const char* phoneNumber, const char* message);
+String htmlEncode(const String& str);
 
 SMSItem smsQueue[SMS_QUEUE_SIZE];
 int sms_q_head = 0; // index of oldest
@@ -93,6 +170,122 @@ unsigned long wifiReconnectInterval = 5000; // 初始重连间隔 ms
 // 系统启动时间（用于定时重启）
 unsigned long bootTime = 0;
 
+// ==================== 持久化配置函数 ====================
+void loadConfig() {
+  preferences.begin("sms_config", true);  // 只读模式
+  
+  // 加载配置，如果不存在则使用默认值
+  strlcpy(rtConfig.wecomUrl, preferences.getString("wecomUrl", WECHAT_WEBHOOK_URL).c_str(), sizeof(rtConfig.wecomUrl));
+  strlcpy(rtConfig.simNumber, preferences.getString("simNumber", LOCAL_SIM_NUMBER).c_str(), sizeof(rtConfig.simNumber));
+  strlcpy(rtConfig.smtpServer, preferences.getString("smtpServer", SMTP_SERVER).c_str(), sizeof(rtConfig.smtpServer));
+  rtConfig.smtpPort = preferences.getUShort("smtpPort", SMTP_SERVER_PORT);
+  strlcpy(rtConfig.smtpUser, preferences.getString("smtpUser", SMTP_USER).c_str(), sizeof(rtConfig.smtpUser));
+  strlcpy(rtConfig.smtpPass, preferences.getString("smtpPass", SMTP_PASS).c_str(), sizeof(rtConfig.smtpPass));
+  strlcpy(rtConfig.smtpTo, preferences.getString("smtpTo", SMTP_SEND_TO).c_str(), sizeof(rtConfig.smtpTo));
+  strlcpy(rtConfig.httpServerUrl, preferences.getString("httpUrl", HTTP_SERVER_URL).c_str(), sizeof(rtConfig.httpServerUrl));
+  rtConfig.enableWecom = preferences.getBool("enWecom", ENABLE_WECOM_BOT);
+  rtConfig.enableEmail = preferences.getBool("enEmail", ENABLE_EMAIL);
+  rtConfig.enableHttp = preferences.getBool("enHttp", ENABLE_HTTP_SERVER);
+  strlcpy(rtConfig.webUser, preferences.getString("webUser", WEB_ADMIN_USER).c_str(), sizeof(rtConfig.webUser));
+  strlcpy(rtConfig.webPass, preferences.getString("webPass", WEB_ADMIN_PASS).c_str(), sizeof(rtConfig.webPass));
+  
+  preferences.end();
+  Serial.println("配置已从 NVS 加载");
+}
+
+void saveConfig() {
+  preferences.begin("sms_config", false);  // 读写模式
+  
+  preferences.putString("wecomUrl", rtConfig.wecomUrl);
+  preferences.putString("simNumber", rtConfig.simNumber);
+  preferences.putString("smtpServer", rtConfig.smtpServer);
+  preferences.putUShort("smtpPort", rtConfig.smtpPort);
+  preferences.putString("smtpUser", rtConfig.smtpUser);
+  preferences.putString("smtpPass", rtConfig.smtpPass);
+  preferences.putString("smtpTo", rtConfig.smtpTo);
+  preferences.putString("httpUrl", rtConfig.httpServerUrl);
+  preferences.putBool("enWecom", rtConfig.enableWecom);
+  preferences.putBool("enEmail", rtConfig.enableEmail);
+  preferences.putBool("enHttp", rtConfig.enableHttp);
+  preferences.putString("webUser", rtConfig.webUser);
+  preferences.putString("webPass", rtConfig.webPass);
+  
+  preferences.end();
+  Serial.println("配置已保存到 NVS");
+}
+
+// HTML 编码函数（防止 XSS）
+String htmlEncode(const String& str) {
+  String result = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    switch (c) {
+      case '&': result += "&amp;"; break;
+      case '<': result += "&lt;"; break;
+      case '>': result += "&gt;"; break;
+      case '"': result += "&quot;"; break;
+      case '\'': result += "&#39;"; break;
+      default: result += c;
+    }
+  }
+  return result;
+}
+
+// HTTP Basic 认证检查
+// 本地 Base64 解码（返回解码后的字符串）
+String base64Decode(const String& input) {
+  auto idx = [](char c)->int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+
+  String out = "";
+  int len = input.length();
+  int i = 0;
+  while (i < len) {
+    int vals[4] = {0,0,0,0};
+    int vcount = 0;
+    int pad = 0;
+    for (int j = 0; j < 4 && i < len; ++j, ++i) {
+      char c = input.charAt(i);
+      if (c == '=') { vals[j] = 0; pad++; vcount++; continue; }
+      int v = idx(c);
+      if (v < 0) { --j; continue; } // skip invalid chars
+      vals[j] = v;
+      vcount++;
+    }
+    if (vcount == 0) break;
+    out += (char)((vals[0] << 2) | ((vals[1] & 0x30) >> 4));
+    if (pad < 2) out += (char)(((vals[1] & 0x0F) << 4) | ((vals[2] & 0x3C) >> 2));
+    if (pad < 1) out += (char)(((vals[2] & 0x03) << 6) | (vals[3] & 0x3F));
+  }
+  return out;
+}
+
+bool checkAuth() {
+  if (!webServer.hasHeader("Authorization")) {
+    return false;
+  }
+  String authHeader = webServer.header("Authorization");
+  if (!authHeader.startsWith("Basic ")) {
+    return false;
+  }
+  String encoded = authHeader.substring(6);
+  String decoded = base64Decode(encoded);
+
+  String expected = String(rtConfig.webUser) + ":" + String(rtConfig.webPass);
+  return decoded == expected;
+}
+
+void requestAuth() {
+  webServer.sendHeader("WWW-Authenticate", "Basic realm=\"SMS Forwarder\"");
+  webServer.send(401, "text/plain", "Authentication Required");
+}
+
 
 // 发送短信数据到服务器，按需修改，返回是否成功
 bool sendSMSToServer(const char* sender, const char* message, const char* timestamp) {
@@ -100,9 +293,12 @@ bool sendSMSToServer(const char* sender, const char* message, const char* timest
     Serial.println("sendSMSToServer: WiFi 未连接");
     return false;
   }
+  if (!rtConfig.enableHttp) {
+    return true;  // 未启用视为成功
+  }
   HTTPClient http;
   Serial.println("\n发送短信数据到服务器...");
-  http.begin(HTTP_SERVER_URL);
+  http.begin(rtConfig.httpServerUrl);
   http.setTimeout(HTTP_TIMEOUT_MS);
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
@@ -137,18 +333,21 @@ bool sendSMSToWeComBot(const char* sender, const char* message, const char* time
     Serial.println("sendSMSToWeComBot: WiFi 未连接");
     return false;
   }
+  if (!rtConfig.enableWecom) {
+    return true;  // 未启用视为成功
+  }
 
   HTTPClient http;
-  http.begin(WECHAT_WEBHOOK_URL);
+  http.begin(rtConfig.wecomUrl);
   http.setTimeout(HTTP_TIMEOUT_MS);
   http.setConnectTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json; charset=utf-8");
 
   String content = "";
   content += "📩 【新短信提醒】\n";
-  content += "📱 接收号码："; content += LOCAL_SIM_NUMBER; content += "\n";
+  content += "📱 接收号码："; content += rtConfig.simNumber; content += "\n";
   content += "👤 发送者："; content += sender; content += "\n";
-  content += "⏰ 时间："; content += timestamp; content += "\n";
+  content += "⏰ 时间："; content += formatTimestamp(timestamp); content += "\n";
   content += "📝 内容："; content += message;
 
   String escapedContent = escapeJson(content.c_str());
@@ -182,20 +381,23 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
     Serial.println("sendSMSToEmail: WiFi 未连接");
     return false;
   }
+  if (!rtConfig.enableEmail) {
+    return true;  // 未启用视为成功
+  }
   auto statusCallback = [](SMTPStatus status) {
     Serial.println(status.text);
   };
-  smtp.connect(SMTP_SERVER, SMTP_SERVER_PORT, statusCallback);
+  smtp.connect(rtConfig.smtpServer, rtConfig.smtpPort, statusCallback);
   if (!smtp.isConnected()) {
     Serial.println("sendSMSToEmail: SMTP 连接失败");
     return false;
   }
-  smtp.authenticate(SMTP_USER, SMTP_PASS, readymail_auth_password);
+  smtp.authenticate(rtConfig.smtpUser, rtConfig.smtpPass, readymail_auth_password);
 
   SMTPMessage msg;
-  String from = "sms notify <"; from+=SMTP_USER; from+=">"; 
+  String from = "sms notify <"; from+=rtConfig.smtpUser; from+=">"; 
   msg.headers.add(rfc822_from, from.c_str());
-  String to = "your_email <"; to+=SMTP_SEND_TO; to+=">"; 
+  String to = "your_email <"; to+=rtConfig.smtpTo; to+=">"; 
   msg.headers.add(rfc822_to, to.c_str());
   String subject = "短信";
   subject += sender;
@@ -211,7 +413,6 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
   while (time(nullptr) < 100000) {
     if (millis() - ntpStart > 10000) {
       Serial.println("sendSMSToEmail: NTP 同步超时");
-      smtp.disconnect();
       return false;
     }
     delay(100);
@@ -219,7 +420,6 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
   }
   msg.timestamp = time(nullptr);
   bool res = smtp.send(msg);
-  smtp.disconnect(); // 关闭连接，释放资源
   if (!res) Serial.println("sendSMSToEmail: 发送失败");
   return res;
 }
@@ -302,19 +502,24 @@ void checkSerial1URC() {
         const char* textPtr = pdu.getText();
         const char* timestampPtr = pdu.getTimeStamp();
 
-        bool allOk = true;
-      #if ENABLE_WECOM_BOT
-        if (!sendSMSToWeComBot(senderPtr, textPtr, timestampPtr)) allOk = false;
-      #endif
-      #if ENABLE_HTTP_SERVER
-        if (!sendSMSToServer(senderPtr, textPtr, timestampPtr)) allOk = false;
-      #endif
-      #if ENABLE_EMAIL
-        if (!sendSMSToEmail(senderPtr, textPtr, timestampPtr)) allOk = false;
-      #endif
-        if (!allOk) {
+        // 各渠道发送状态
+        bool wecomOk = true, emailOk = true, httpOk = true;
+        if (rtConfig.enableWecom) {
+          wecomOk = sendSMSToWeComBot(senderPtr, textPtr, timestampPtr);
+        }
+        if (rtConfig.enableHttp) {
+          httpOk = sendSMSToServer(senderPtr, textPtr, timestampPtr);
+        }
+        if (rtConfig.enableEmail) {
+          emailOk = sendSMSToEmail(senderPtr, textPtr, timestampPtr);
+        }
+        // 只有存在失败的渠道才入队，并记录各渠道状态
+        bool needRetry = (rtConfig.enableWecom && !wecomOk) || 
+                         (rtConfig.enableEmail && !emailOk) || 
+                         (rtConfig.enableHttp && !httpOk);
+        if (needRetry) {
           Serial.println("部分或全部发送失败，入队以便重试");
-          enqueueSMS(senderPtr, textPtr, timestampPtr);
+          enqueueSMSWithStatus(senderPtr, textPtr, timestampPtr, wecomOk, emailOk, httpOk);
         }
       }
       
@@ -371,8 +576,13 @@ void setup() {
   // 记录启动时间
   bootTime = millis();
   
-  // 初始化看门狗（防止死锁）
-  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+  // 初始化看门狗（防止死锁）- 兼容 ESP-IDF 5.x
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SEC * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,  // 监控所有核心
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
   
   pinMode(LED_BUILTIN, OUTPUT);
@@ -380,10 +590,20 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
   Serial1.setRxBufferSize(SERIAL_BUFFER_SIZE);
+  
+  // 加载持久化配置
+  loadConfig();
+  
   WiFiMulti.addAP(WIFI_SSID, WIFI_PASS);
   Serial.println("连接wifi");
   while (WiFiMulti.run() != WL_CONNECTED) blink_short();
   Serial.println("wifi已连接");
+  Serial.print("IP 地址: ");
+  Serial.println(WiFi.localIP());
+  
+  // 启动 Web 服务器
+  setupWebServer();
+  
   ssl_client.setInsecure();
   while (!sendATandWaitOK("AT", 1000)) {
     Serial.println("AT未响应，重试...");
@@ -415,6 +635,9 @@ unsigned long getUptimeDays() {
 void loop() {
   // 喂狗
   esp_task_wdt_reset();
+  
+  // 处理 Web 请求
+  webServer.handleClient();
   
   // 定时重启检查（仅在队列为空时重启，避免丢失数据）
   if ((millis() - bootTime) >= SCHEDULED_RESTART_INTERVAL_MS && sms_q_count == 0) {
@@ -451,6 +674,12 @@ void loop() {
 
 // 队列操作函数
 void enqueueSMS(const char* sender, const char* text, const char* timestamp) {
+  // 默认所有渠道都未发送成功
+  enqueueSMSWithStatus(sender, text, timestamp, false, false, false);
+}
+
+// 带渠道状态的入队函数
+void enqueueSMSWithStatus(const char* sender, const char* text, const char* timestamp, bool wecomOk, bool emailOk, bool httpOk) {
   int insertIdx = (sms_q_head + sms_q_count) % SMS_QUEUE_SIZE;
   if (sms_q_count == SMS_QUEUE_SIZE) {
     // 队列已满，丢弃最老一条以腾出空间
@@ -470,6 +699,10 @@ void enqueueSMS(const char* sender, const char* text, const char* timestamp) {
   smsQueue[insertIdx].retries = 0;
   smsQueue[insertIdx].lastAttempt = 0;
   smsQueue[insertIdx].valid = true;
+  // 记录各渠道发送状态（true=已成功，无需重试）
+  smsQueue[insertIdx].wecomSent = wecomOk;
+  smsQueue[insertIdx].emailSent = emailOk;
+  smsQueue[insertIdx].httpSent = httpOk;
   sms_q_count++;
   Serial.printf("已入队，队列长度=%d\n", sms_q_count);
 }
@@ -481,21 +714,34 @@ void removeHeadSMS() {
   sms_q_count--;
 }
 
-// 尝试发送单条短信到所有开启的渠道，返回是否全部成功
-bool trySendChannels(const SMSItem &item) {
+// 尝试发送单条短信到未成功的渠道，返回是否全部成功
+// 注意：只重试之前失败的渠道，避免重复发送
+bool trySendChannels(SMSItem &item) {
   bool allOk = true;
-#if ENABLE_WECOM_BOT
-  bool okWeCom = sendSMSToWeComBot(item.sender, item.text, item.timestamp);
-  if (!okWeCom) allOk = false;
-#endif
-#if ENABLE_HTTP_SERVER
-  bool okHttp = sendSMSToServer(item.sender, item.text, item.timestamp);
-  if (!okHttp) allOk = false;
-#endif
-#if ENABLE_EMAIL
-  bool okEmail = sendSMSToEmail(item.sender, item.text, item.timestamp);
-  if (!okEmail) allOk = false;
-#endif
+  if (rtConfig.enableWecom && !item.wecomSent) {
+    if (sendSMSToWeComBot(item.sender, item.text, item.timestamp)) {
+      item.wecomSent = true;  // 标记为已成功
+      Serial.println("企业微信发送成功");
+    } else {
+      allOk = false;
+    }
+  }
+  if (rtConfig.enableHttp && !item.httpSent) {
+    if (sendSMSToServer(item.sender, item.text, item.timestamp)) {
+      item.httpSent = true;  // 标记为已成功
+      Serial.println("HTTP服务器发送成功");
+    } else {
+      allOk = false;
+    }
+  }
+  if (rtConfig.enableEmail && !item.emailSent) {
+    if (sendSMSToEmail(item.sender, item.text, item.timestamp)) {
+      item.emailSent = true;  // 标记为已成功
+      Serial.println("邮件发送成功");
+    } else {
+      allOk = false;
+    }
+  }
   return allOk;
 }
 
@@ -570,4 +816,203 @@ void ensureWiFiConnected() {
     wifiReconnectInterval = min(wifiReconnectInterval * 2, 60000UL);
     Serial.printf("WiFi 重连失败，下次间隔 %lu ms\n", wifiReconnectInterval);
   }
+}
+
+// ----------------- Web 管理与短信发送功能 -----------------
+
+// 发送短信到手机（使用模组的文本模式 AT+CMGF）
+bool sendSMS(const char* phoneNumber, const char* message) {
+  // 确保串口空
+  while (Serial1.available()) Serial1.read();
+  Serial.printf("发送短信: 到 %s, 内容: %s\n", phoneNumber, message);
+
+  // 设置文本模式
+  Serial1.println("AT+CMGF=1");
+  unsigned long start = millis();
+  String resp = "";
+  bool ok = false;
+  while (millis() - start < 2000) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      resp += c;
+      if (resp.indexOf("OK") >= 0) { ok = true; break; }
+      if (resp.indexOf("ERROR") >= 0) { ok = false; break; }
+    }
+    if (ok) break;
+  }
+  if (!ok) {
+    Serial.println("模组设置文本模式失败");
+    return false;
+  }
+
+  // 发送短信命令
+  resp = "";
+  String cmd = String("AT+CMGS=\"") + phoneNumber + "\"";
+  Serial1.println(cmd);
+  start = millis();
+  bool prompt = false;
+  while (millis() - start < 5000) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      resp += c;
+      // 有些模组返回 '>' 提示输入短信内容
+      if (resp.indexOf('>') >= 0) { prompt = true; break; }
+      if (resp.indexOf("ERROR") >= 0) { break; }
+    }
+    if (prompt) break;
+  }
+  if (!prompt) {
+    Serial.println("模组未返回输入提示，发送失败");
+    return false;
+  }
+
+  // 发送消息体并以 Ctrl+Z 终止
+  Serial1.print(message);
+  Serial1.write((char)26);
+
+  // 等待 +CMGS 或 OK
+  resp = "";
+  start = millis();
+  bool sent = false;
+  while (millis() - start < 15000) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      resp += c;
+      if (resp.indexOf("+CMGS:") >= 0 || resp.indexOf("OK") >= 0) { sent = true; break; }
+      if (resp.indexOf("ERROR") >= 0) { sent = false; break; }
+    }
+    if (sent) break;
+  }
+  Serial.printf("模组返回: %s\n", resp.c_str());
+  return sent;
+}
+
+// Web 页面：根目录（仪表盘 + 发送表单）
+void handleRoot() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String html = "<html><head><meta charset=\"utf-8\"><title>SMS Forwarder</title></head><body>";
+  html += "<h2>SMS Forwarder</h2>";
+  html += "<form method=\"POST\" action=\"/send\">";
+  html += "目标号码：<input name=\"to\" size=20><br>";
+  html += "消息：<br><textarea name=\"msg\" rows=6 cols=40></textarea><br>";
+  html += "<input type=\"submit\" value=\"发送短信\">";
+  html += "</form>";
+  html += "<p><a href=\"/config\">配置</a> | <a href=\"/queue\">队列</a></p>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+// 发送接口（表单提交）
+void handleSend() {
+  if (!checkAuth()) { requestAuth(); return; }
+  if (webServer.method() != HTTP_POST) {
+    webServer.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  String to = webServer.arg("to");
+  String msg = webServer.arg("msg");
+  if (to.length() == 0 || msg.length() == 0) {
+    webServer.send(400, "text/plain; charset=utf-8", "参数缺失");
+    return;
+  }
+  bool ok = sendSMS(to.c_str(), msg.c_str());
+  String res = ok ? "已发送" : "发送失败";
+  webServer.send(200, "text/plain; charset=utf-8", res + "\n");
+}
+
+// 配置页面（查看与保存）
+void handleConfigGet() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String html = "<html><head><meta charset=\"utf-8\"><title>配置</title></head><body>";
+  html += "<h2>配置</h2>";
+  html += "<form method=\"POST\" action=\"/config\">";
+  html += "企业微信 Webhook：<br><input name=\"wecom\" size=60 value=\"" + htmlEncode(String(rtConfig.wecomUrl)) + "\"><br>";
+  html += "接收号码：<br><input name=\"simnum\" size=20 value=\"" + htmlEncode(String(rtConfig.simNumber)) + "\"><br>";
+  html += "SMTP 服务器：<br><input name=\"smtpserver\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpServer)) + "\"><br>";
+  html += "SMTP 端口：<br><input name=\"smtpport\" size=6 value=\"" + String(rtConfig.smtpPort) + "\"><br>";
+  html += "SMTP 用户：<br><input name=\"smtpuser\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpUser)) + "\"><br>";
+  html += "SMTP 密码：<br><input name=\"smtppass\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpPass)) + "\"><br>";
+  html += "邮件收件：<br><input name=\"smtpto\" size=40 value=\"" + htmlEncode(String(rtConfig.smtpTo)) + "\"><br>";
+  html += "HTTP 服务器：<br><input name=\"httpurl\" size=60 value=\"" + htmlEncode(String(rtConfig.httpServerUrl)) + "\"><br>";
+  html += "启用 企业微信：<input type=\"checkbox\" name=\"enwecom\" " + String(rtConfig.enableWecom?"checked":"") + "><br>";
+  html += "启用 邮件：<input type=\"checkbox\" name=\"enemail\" " + String(rtConfig.enableEmail?"checked":"") + "><br>";
+  html += "启用 HTTP：<input type=\"checkbox\" name=\"enhttp\" " + String(rtConfig.enableHttp?"checked":"") + "><br>";
+  html += "Web 用户：<br><input name=\"webuser\" size=20 value=\"" + htmlEncode(String(rtConfig.webUser)) + "\"><br>";
+  html += "Web 密码：<br><input name=\"webpass\" size=20 value=\"" + htmlEncode(String(rtConfig.webPass)) + "\"><br>";
+  html += "<input type=\"submit\" value=\"保存\">";
+  html += "</form>";
+  html += "<p><a href=\"/\">返回</a></p>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+void handleConfigPost() {
+  if (!checkAuth()) { requestAuth(); return; }
+  // 保存表单
+  String wecom = webServer.arg("wecom");
+  String simnum = webServer.arg("simnum");
+  String smtpserver = webServer.arg("smtpserver");
+  uint16_t smtpport = webServer.arg("smtpport").toInt();
+  String smtpuser = webServer.arg("smtpuser");
+  String smtppass = webServer.arg("smtppass");
+  String smtpto = webServer.arg("smtpto");
+  String httpurl = webServer.arg("httpurl");
+  bool enwecom = webServer.hasArg("enwecom");
+  bool enemail = webServer.hasArg("enemail");
+  bool enhttp = webServer.hasArg("enhttp");
+  String webuser = webServer.arg("webuser");
+  String webpass = webServer.arg("webpass");
+
+  strlcpy(rtConfig.wecomUrl, wecom.c_str(), sizeof(rtConfig.wecomUrl));
+  strlcpy(rtConfig.simNumber, simnum.c_str(), sizeof(rtConfig.simNumber));
+  strlcpy(rtConfig.smtpServer, smtpserver.c_str(), sizeof(rtConfig.smtpServer));
+  rtConfig.smtpPort = smtpport;
+  strlcpy(rtConfig.smtpUser, smtpuser.c_str(), sizeof(rtConfig.smtpUser));
+  strlcpy(rtConfig.smtpPass, smtppass.c_str(), sizeof(rtConfig.smtpPass));
+  strlcpy(rtConfig.smtpTo, smtpto.c_str(), sizeof(rtConfig.smtpTo));
+  strlcpy(rtConfig.httpServerUrl, httpurl.c_str(), sizeof(rtConfig.httpServerUrl));
+  rtConfig.enableWecom = enwecom;
+  rtConfig.enableEmail = enemail;
+  rtConfig.enableHttp = enhttp;
+  strlcpy(rtConfig.webUser, webuser.c_str(), sizeof(rtConfig.webUser));
+  strlcpy(rtConfig.webPass, webpass.c_str(), sizeof(rtConfig.webPass));
+
+  saveConfig();
+  webServer.send(200, "text/plain; charset=utf-8", "配置已保存\n");
+}
+
+// 队列查看页面
+void handleQueue() {
+  if (!checkAuth()) { requestAuth(); return; }
+  String html = "<html><head><meta charset=\"utf-8\"><title>队列</title></head><body>";
+  html += "<h2>待重试短信队列</h2>";
+  html += "<table border=1><tr><th>#</th><th>发送者</th><th>时间</th><th>内容</th><th>状态</th></tr>";
+  for (int i = 0; i < sms_q_count; i++) {
+    int idx = (sms_q_head + i) % SMS_QUEUE_SIZE;
+    SMSItem &it = smsQueue[idx];
+    html += "<tr>";
+    html += "<td>" + String(i+1) + "</td>";
+    html += "<td>" + String(it.sender) + "</td>";
+    html += "<td>" + String(it.timestamp) + "</td>";
+    html += "<td>" + htmlEncode(String(it.text)) + "</td>";
+    String st = "";
+    st += (it.wecomSent?"wecom ":"");
+    st += (it.emailSent?"email ":"");
+    st += (it.httpSent?"http ":"");
+    html += "<td>" + st + "</td>";
+    html += "</tr>";
+  }
+  html += "</table><p><a href=\"/\">返回</a></p></body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+// 初始化 Web 路由
+void setupWebServer() {
+  webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/send", HTTP_POST, handleSend);
+  webServer.on("/config", HTTP_GET, handleConfigGet);
+  webServer.on("/config", HTTP_POST, handleConfigPost);
+  webServer.on("/queue", HTTP_GET, handleQueue);
+  webServer.begin();
+  Serial.println("Web 服务器已启动");
 }
