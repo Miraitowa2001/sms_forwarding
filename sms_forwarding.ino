@@ -190,6 +190,7 @@ void setupWebServer();
 bool checkAuth();
 bool sendSMS(const char* phoneNumber, const char* message);
 String htmlEncode(const String& str);
+void processReceivedSMS(const char* sender, const char* text, const char* timestamp);
 
 SMSItem smsQueue[SMS_QUEUE_SIZE];
 int sms_q_head = 0; // index of oldest
@@ -490,6 +491,29 @@ bool isHexString(const String& str) {
   return true;
 }
 
+// 处理接收到的短信内容（分发到各渠道）
+void processReceivedSMS(const char* sender, const char* text, const char* timestamp) {
+  // 各渠道发送状态
+  bool wecomOk = true, emailOk = true, httpOk = true;
+  if (rtConfig.enableWecom) {
+    wecomOk = sendSMSToWeComBot(sender, text, timestamp);
+  }
+  if (rtConfig.enableHttp) {
+    httpOk = sendSMSToServer(sender, text, timestamp);
+  }
+  if (rtConfig.enableEmail) {
+    emailOk = sendSMSToEmail(sender, text, timestamp);
+  }
+  // 只有存在失败的渠道才入队，并记录各渠道状态
+  bool needRetry = (rtConfig.enableWecom && !wecomOk) || 
+                   (rtConfig.enableEmail && !emailOk) || 
+                   (rtConfig.enableHttp && !httpOk);
+  if (needRetry) {
+    Serial.println("部分或全部发送失败，入队以便重试");
+    enqueueSMSWithStatus(sender, text, timestamp, wecomOk, emailOk, httpOk);
+  }
+}
+
 // 处理URC和PDU
 void checkSerial1URC() {
   static enum { IDLE,
@@ -530,29 +554,7 @@ void checkSerial1URC() {
         Serial.println("===============");
 
         // 根据配置开关执行各推送方式：先尝试立即发送，失败则入队重试
-        const char* senderPtr = pdu.getSender();
-        const char* textPtr = pdu.getText();
-        const char* timestampPtr = pdu.getTimeStamp();
-
-        // 各渠道发送状态
-        bool wecomOk = true, emailOk = true, httpOk = true;
-        if (rtConfig.enableWecom) {
-          wecomOk = sendSMSToWeComBot(senderPtr, textPtr, timestampPtr);
-        }
-        if (rtConfig.enableHttp) {
-          httpOk = sendSMSToServer(senderPtr, textPtr, timestampPtr);
-        }
-        if (rtConfig.enableEmail) {
-          emailOk = sendSMSToEmail(senderPtr, textPtr, timestampPtr);
-        }
-        // 只有存在失败的渠道才入队，并记录各渠道状态
-        bool needRetry = (rtConfig.enableWecom && !wecomOk) || 
-                         (rtConfig.enableEmail && !emailOk) || 
-                         (rtConfig.enableHttp && !httpOk);
-        if (needRetry) {
-          Serial.println("部分或全部发送失败，入队以便重试");
-          enqueueSMSWithStatus(senderPtr, textPtr, timestampPtr, wecomOk, emailOk, httpOk);
-        }
+        processReceivedSMS(pdu.getSender(), pdu.getText(), pdu.getTimeStamp());
       }
       
       // 返回IDLE状态
@@ -954,6 +956,14 @@ void handleRoot() {
   html += "<label>消息内容</label><textarea name=\"msg\" rows=5 placeholder=\"输入短信内容\"></textarea>";
   html += "<input type=\"submit\" value=\"发送短信\">";
   html += "</form></div>";
+
+  html += "<div class='card'><h2>模拟接收短信 (测试)</h2>";
+  html += "<form method=\"POST\" action=\"/simulate\">";
+  html += "<label>模拟发送者</label><input name=\"sender\" value=\"10086\">";
+  html += "<label>模拟内容</label><textarea name=\"text\" rows=3>这是一条测试短信</textarea>";
+  html += "<input type=\"submit\" value=\"模拟接收\">";
+  html += "</form></div>";
+
   html += getFooter();
   webServer.send(200, "text/html", html);
 }
@@ -1084,10 +1094,37 @@ void handleQueue() {
   webServer.send(200, "text/html", html);
 }
 
+// 模拟接收短信接口
+void handleSimulateReceive() {
+  if (!checkAuth()) { requestAuth(); return; }
+  if (webServer.method() != HTTP_POST) {
+    webServer.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  String sender = webServer.arg("sender");
+  String text = webServer.arg("text");
+  
+  // 生成一个模拟的 PDU 时间戳 (YYMMDDHHmmss+TZ)
+  // 25010112000032 -> 2025-01-01 12:00:00 +8h
+  String timestamp = "25010112000032"; 
+  
+  processReceivedSMS(sender.c_str(), text.c_str(), timestamp.c_str());
+  
+  String html = getHeader("模拟接收结果");
+  html += "<div class='card' style='text-align:center'><h2>✅ 模拟接收已触发</h2>";
+  html += "<p>发送者: " + htmlEncode(sender) + "</p>";
+  html += "<p>内容: " + htmlEncode(text) + "</p>";
+  html += "<p>请检查各推送渠道是否收到消息。</p>";
+  html += "<p><a href='/'>返回首页</a></p></div>";
+  html += getFooter();
+  webServer.send(200, "text/html", html);
+}
+
 // 初始化 Web 路由
 void setupWebServer() {
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/send", HTTP_POST, handleSend);
+  webServer.on("/simulate", HTTP_POST, handleSimulateReceive);
   webServer.on("/config", HTTP_GET, handleConfigGet);
   webServer.on("/config", HTTP_POST, handleConfigPost);
   webServer.on("/queue", HTTP_GET, handleQueue);

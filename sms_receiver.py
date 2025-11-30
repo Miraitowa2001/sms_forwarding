@@ -331,6 +331,38 @@ WEB_TEMPLATE = '''
                  border-radius: 6px; display: none; z-index: 1000; }
         .toast.show { display: block; animation: fadeIn 0.3s; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            .header { flex-direction: column; align-items: flex-start; gap: 10px; }
+            .stats { gap: 10px; }
+            .stat-item { flex: 1; padding: 10px; }
+            
+            /* Table to Card view */
+            table, thead, tbody, th, td, tr { display: block; }
+            thead tr { position: absolute; top: -9999px; left: -9999px; }
+            tr { margin-bottom: 15px; border: 1px solid #e0e0e0; border-radius: 8px; padding: 12px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.05); position: relative; }
+            td { border: none; padding: 2px 0; }
+            
+            /* Checkbox - Top Right */
+            td:nth-child(1) { position: absolute; top: 12px; right: 12px; width: auto; height: auto; padding: 0; }
+            
+            /* Sender */
+            td:nth-child(2) { padding-right: 30px; margin-bottom: 5px; }
+            .sender { white-space: normal; font-size: 16px; }
+            
+            /* Message */
+            td:nth-child(3) { margin-bottom: 8px; }
+            .message { max-width: none; font-size: 15px; line-height: 1.5; color: #333; }
+            
+            /* Time */
+            td:nth-child(4) { margin-bottom: 10px; }
+            .time { white-space: normal; color: #888; font-size: 12px; }
+            
+            /* Actions */
+            td:nth-child(5) { border-top: 1px solid #f0f0f0; padding-top: 10px; text-align: right; }
+            td:nth-child(5) button { width: auto; padding: 6px 12px; }
+        }
     </style>
 </head>
 <body>
