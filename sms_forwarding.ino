@@ -662,7 +662,7 @@ void setup() {
 
 // 堆内存监控间隔
 static unsigned long lastHeapCheck = 0;
-#define HEAP_CHECK_INTERVAL_MS 300000UL // 5 分钟
+#define HEAP_CHECK_INTERVAL_MS (12UL * 60UL * 60UL * 1000UL) // 12 小时
 
 // 计算运行时间（天）
 unsigned long getUptimeDays() {
