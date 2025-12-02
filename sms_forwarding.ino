@@ -442,15 +442,10 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
   // 构建格式化的邮件正文
   String formattedTime = formatTimestamp(timestamp);
   String body = "";
-  body += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-  body += "📱 短信转发通知\n";
-  body += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+  body += "短信内容："; body += message; body += "\n";  
   body += "📞 发送者："; body += sender; body += "\n";
   body += "🕐 时  间："; body += formattedTime; body += "\n";
-  body += "📍 接收卡："; body += rtConfig.simNumber; body += "\n\n";
-  body += "━━━━━━━━ 短信内容 ━━━━━━━━\n\n";
-  body += message;
-  body += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+  body += "📍 接收卡："; body += rtConfig.simNumber; body += "\n";
   body += "此邮件由 SMS Forwarder 自动发送\n";
   msg.text.body(body.c_str());
   
