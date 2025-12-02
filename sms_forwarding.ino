@@ -429,16 +429,29 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
   smtp.authenticate(rtConfig.smtpUser, rtConfig.smtpPass, readymail_auth_password);
 
   SMTPMessage msg;
-  String from = "sms notify <"; from+=rtConfig.smtpUser; from+=">"; 
+  String from = "SMS Forwarder <"; from+=rtConfig.smtpUser; from+=">"; 
   msg.headers.add(rfc822_from, from.c_str());
-  String to = "your_email <"; to+=rtConfig.smtpTo; to+=">"; 
+  String to = "Recipient <"; to+=rtConfig.smtpTo; to+=">"; 
   msg.headers.add(rfc822_to, to.c_str());
-  String subject = "短信";
+  
+  // 构建简洁的邮件主题：【短信转发】发送者号码
+  String subject = "【短信转发】";
   subject += sender;
-  subject += ",";
-  subject += message;
   msg.headers.add(rfc822_subject, subject.c_str());
-  String body = "来自："; body+=sender; body+="，时间："; body+=timestamp; body+="，内容："; body+=message;
+  
+  // 构建格式化的邮件正文
+  String formattedTime = formatTimestamp(timestamp);
+  String body = "";
+  body += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+  body += "📱 短信转发通知\n";
+  body += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n";
+  body += "📞 发送者："; body += sender; body += "\n";
+  body += "🕐 时  间："; body += formattedTime; body += "\n";
+  body += "📍 接收卡："; body += rtConfig.simNumber; body += "\n\n";
+  body += "━━━━━━━━ 短信内容 ━━━━━━━━\n\n";
+  body += message;
+  body += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+  body += "此邮件由 SMS Forwarder 自动发送\n";
   msg.text.body(body.c_str());
   
   // NTP 同步（带超时保护，最多等待 10 秒）
