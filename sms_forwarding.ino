@@ -419,6 +419,7 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
   }
   auto statusCallback = [](SMTPStatus status) {
     Serial.println(status.text);
+    esp_task_wdt_reset(); // 喂狗防止超时
   };
   smtp.connect(rtConfig.smtpServer, rtConfig.smtpPort, statusCallback);
   if (!smtp.isConnected()) {
@@ -452,6 +453,7 @@ bool sendSMSToEmail(const char* sender, const char* message, const char* timesta
     esp_task_wdt_reset(); // 喂狗防止超时
   }
   msg.timestamp = time(nullptr);
+  esp_task_wdt_reset(); // 发送前喂狗
   bool res = smtp.send(msg);
   if (!res) Serial.println("sendSMSToEmail: 发送失败");
   return res;
@@ -639,6 +641,7 @@ void setup() {
   setupWebServer();
   
   ssl_client.setInsecure();
+  ssl_client.setTimeout(30000); // 设置 SSL 超时 30s，防止网络卡死触发看门狗
   while (!sendATandWaitOK("AT", 1000)) {
     Serial.println("AT未响应，重试...");
     blink_short();
